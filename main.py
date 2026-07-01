@@ -2,17 +2,19 @@
 main.py
 
 Detects and extracts individual stickers from a sticker sheet PNG using
-bubble-edge segmentation. Supports two edge detectors:
+bubble-edge segmentation. Supports three edge detectors:
   - Canny (fast, classical)
-  - HED — Holistically-Nested Edge Detection (deep learning, better semantic edges)
+  - HED  — Holistically-Nested Edge Detection (deep learning, ~56 MB model)
+  - TEED — Tiny and Efficient Edge Detector (deep learning, ~6 MB model)
 
-Pass --compare to run both in debug mode and save side-by-side comparison images.
+Pass --compare to run all three in debug mode and save side-by-side comparison images.
+HED is used for segmentation when available; otherwise TEED, then Canny.
 
 Usage:
     python main.py sheet.png [--out-dir output/] [--min-area 5000] [--debug] [--compare]
 
 Requirements:
-    pip install opencv-python pillow numpy
+    pip install opencv-python pillow numpy torch
 """
 
 import argparse
@@ -23,6 +25,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+
+from teed import TED, load_teed_net, run_teed
 
 
 class _CropLayer:
@@ -177,25 +181,54 @@ def detect_edges_hed(
 
 
 # ---------------------------------------------------------------------------
-# Step 2c — side-by-side comparison debug image
+# Step 2c — TEED edge detection
+# ---------------------------------------------------------------------------
+
+def detect_edges_teed(
+    img_np: np.ndarray,
+    model: TED,
+    debug_dir: Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    edges = run_teed(model, img_np)
+    save_debug("03c_teed_edges_raw.png", edges, debug_dir)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
+    save_debug("04c_teed_edges_closed.png", edges_closed, debug_dir)
+
+    return edges, edges_closed
+
+
+# ---------------------------------------------------------------------------
+# Step 2d — side-by-side comparison debug image
 # ---------------------------------------------------------------------------
 
 def save_edge_comparison(
     canny_raw: np.ndarray,
     canny_closed: np.ndarray,
-    hed_raw: np.ndarray,
-    hed_closed: np.ndarray,
+    hed_raw: np.ndarray | None,
+    hed_closed: np.ndarray | None,
+    teed_raw: np.ndarray | None,
+    teed_closed: np.ndarray | None,
     debug_dir: Path | None,
 ) -> None:
     if debug_dir is None:
         return
-    row1 = side_by_side([
+    panels = [
         labeled_panel(canny_raw,    "Canny — raw"),
         labeled_panel(canny_closed, "Canny — closed"),
-        labeled_panel(hed_raw,      "HED   — raw"),
-        labeled_panel(hed_closed,   "HED   — closed"),
-    ])
-    save_debug("05_edge_comparison.png", row1, debug_dir)
+    ]
+    if hed_raw is not None and hed_closed is not None:
+        panels += [
+            labeled_panel(hed_raw,      "HED   — raw"),
+            labeled_panel(hed_closed,   "HED   — closed"),
+        ]
+    if teed_raw is not None and teed_closed is not None:
+        panels += [
+            labeled_panel(teed_raw,    "TEED  — raw"),
+            labeled_panel(teed_closed, "TEED  — closed"),
+        ]
+    save_debug("05_edge_comparison.png", side_by_side(panels), debug_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -243,16 +276,18 @@ def find_bubble_contours(
 
 def save_fill_comparison(
     canny_fill: np.ndarray,
-    hed_fill: np.ndarray,
+    hed_fill: np.ndarray | None,
+    teed_fill: np.ndarray | None,
     debug_dir: Path | None,
 ) -> None:
     if debug_dir is None:
         return
-    row = side_by_side([
-        labeled_panel(canny_fill, "Canny fills"),
-        labeled_panel(hed_fill,   "HED fills"),
-    ])
-    save_debug("08_fill_comparison.png", row, debug_dir)
+    panels = [labeled_panel(canny_fill, "Canny fills")]
+    if hed_fill is not None:
+        panels.append(labeled_panel(hed_fill, "HED fills"))
+    if teed_fill is not None:
+        panels.append(labeled_panel(teed_fill, "TEED fills"))
+    save_debug("08_fill_comparison.png", side_by_side(panels), debug_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +351,7 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Save pipeline debug images to --debug-dir")
     parser.add_argument("--debug-dir", default="debug")
     parser.add_argument("--compare", action="store_true",
-                        help="Also run HED and save side-by-side comparisons (requires --debug; downloads ~56 MB model on first run)")
+                        help="Run HED and TEED alongside Canny and save side-by-side comparisons (requires --debug; downloads models on first run)")
     parser.add_argument("--models-dir", default="models", help="Directory to cache HED model files")
     parser.add_argument("--padding", type=int, default=20)
     parser.add_argument("--min-area", type=int, default=5000)
@@ -347,6 +382,7 @@ def main() -> None:
     canny_raw, canny_closed = detect_edges_canny(gray, blur_ksize, args.canny_low, args.canny_high, debug_dir)
 
     hed_raw = hed_closed = None
+    teed_raw = teed_closed = None
     if args.compare:
         if not args.debug:
             print("Warning: --compare has no effect without --debug. Add --debug to save comparison images.")
@@ -354,28 +390,54 @@ def main() -> None:
             print("Step 2b — HED edges (loading model)...")
             net = load_hed_net(Path(args.models_dir))
             hed_raw, hed_closed = detect_edges_hed(img_np, net, debug_dir)
-            save_edge_comparison(canny_raw, canny_closed, hed_raw, hed_closed, debug_dir)
 
-    # Use HED for segmentation when available, otherwise fall back to Canny
-    active_edges = hed_closed if hed_closed is not None else canny_closed
-    active_label = "HED" if hed_closed is not None else "Canny"
+            print("Step 2c — TEED edges (loading model)...")
+            teed_model = load_teed_net(Path(args.models_dir))
+            teed_raw, teed_closed = detect_edges_teed(img_np, teed_model, debug_dir)
+
+            save_edge_comparison(canny_raw, canny_closed, hed_raw, hed_closed, teed_raw, teed_closed, debug_dir)
+
+    # Use HED for segmentation when available, otherwise TEED, otherwise Canny
+    if hed_closed is not None:
+        active_edges, active_label = hed_closed, "HED"
+    elif teed_closed is not None:
+        active_edges, active_label = teed_closed, "TEED"
+    else:
+        active_edges, active_label = canny_closed, "Canny"
 
     print(f"Step 3 — bubble contours via {active_label} (min-area={args.min_area})...")
     boxes, masks = find_bubble_contours(active_edges, img_np, args.min_area, "06_active", debug_dir)
     print(f"Found {len(boxes)} sticker(s)")
 
-    if args.compare and hed_closed is not None and debug_dir is not None:
-        print("  (also segmenting with Canny for fill comparison...)")
-        _, canny_masks = find_bubble_contours(canny_closed, img_np, args.min_area, "07_canny", debug_dir)
-        # Build composite fill images for comparison
+    if args.compare and debug_dir is not None and (hed_closed is not None or teed_closed is not None):
+        print("  (also segmenting with remaining detectors for fill comparison...)")
         h_img, w_img = img_np.shape[:2]
-        hed_fill = np.zeros((h_img, w_img), dtype=np.uint8)
+
+        # active fill (HED or TEED, whichever drove segmentation)
+        active_fill = np.zeros((h_img, w_img), dtype=np.uint8)
         for m in masks:
-            hed_fill = cv2.bitwise_or(hed_fill, m)
+            active_fill = cv2.bitwise_or(active_fill, m)
+
+        _, canny_masks = find_bubble_contours(canny_closed, img_np, args.min_area, "07_canny", debug_dir)
         canny_fill = np.zeros((h_img, w_img), dtype=np.uint8)
         for m in canny_masks:
             canny_fill = cv2.bitwise_or(canny_fill, m)
-        save_fill_comparison(canny_fill, hed_fill, debug_dir)
+
+        hed_fill: np.ndarray | None = None
+        teed_fill: np.ndarray | None = None
+        if hed_closed is not None and teed_closed is not None:
+            # active was HED; also compute TEED fill
+            hed_fill = active_fill
+            _, teed_masks = find_bubble_contours(teed_closed, img_np, args.min_area, "07_teed", debug_dir)
+            teed_fill = np.zeros((h_img, w_img), dtype=np.uint8)
+            for m in teed_masks:
+                teed_fill = cv2.bitwise_or(teed_fill, m)
+        elif hed_closed is not None:
+            hed_fill = active_fill
+        else:
+            teed_fill = active_fill
+
+        save_fill_comparison(canny_fill, hed_fill, teed_fill, debug_dir)
 
     if not boxes:
         print("No bubbles detected. Try lowering --min-area or adjusting edge detection parameters.")
