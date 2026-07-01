@@ -1,109 +1,56 @@
 """
 main.py
 
-Detects and extracts individual stickers from a sticker sheet PNG using
-bubble-edge segmentation. Supports three edge detectors:
-  - Canny (fast, classical)
-  - HED  — Holistically-Nested Edge Detection (deep learning, ~56 MB model)
-  - TEED — Tiny and Efficient Edge Detector (deep learning, ~6 MB model)
+Detects and extracts individual stickers from a sticker sheet PNG.
 
-Pass --compare to run all three in debug mode and save side-by-side comparison images.
-HED is used for segmentation when available; otherwise TEED, then Canny.
+Pipeline:
+  1. Threshold  — pixels darker than --bg-threshold are "sticker content"
+  2. Grid split — projection profiles find row/column cut lines (handles
+                  stickers that are too close to separate by morphology alone)
+  3. Per-cell   — morphological close + contour fill within each isolated cell
+  4. Crop+alpha — export each sticker as a transparent PNG with soft edges
 
 Usage:
-    python main.py sheet.png [--out-dir output/] [--min-area 5000] [--debug] [--compare]
+    python main.py sheet.png [options]
 
 Requirements:
-    pip install opencv-python pillow numpy torch
+    pip install opencv-python pillow numpy
 """
 
 import argparse
 import sys
-import urllib.request
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
 
-from teed import TED, load_teed_net, run_teed
-
-
-class _CropLayer:
-    """Custom Caffe crop layer for OpenCV DNN — required by HED."""
-
-    def __init__(self, _params, _blobs):
-        self.x0 = self.y0 = self.x1 = self.y1 = 0
-
-    def getMemoryShapes(self, inputs):
-        src, ref = inputs[0], inputs[1]
-        self.y0 = (src[2] - ref[2]) // 2
-        self.x0 = (src[3] - ref[3]) // 2
-        self.y1 = self.y0 + ref[2]
-        self.x1 = self.x0 + ref[3]
-        return [[src[0], src[1], ref[2], ref[3]]]
-
-    def forward(self, inputs):
-        return [inputs[0][:, :, self.y0:self.y1, self.x0:self.x1]]
-
-
-def load_hed_net(model_dir: Path) -> cv2.dnn.Net:
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    proto_path = model_dir / "hed_deploy.prototxt"
-    model_path = model_dir / "hed_pretrained_bsds.caffemodel"
-
-    cv2.dnn_registerLayer("Crop", _CropLayer)
-    net = cv2.dnn.readNetFromCaffe(str(proto_path), str(model_path))
-    return net
-
 
 # ---------------------------------------------------------------------------
 # Debug helpers
 # ---------------------------------------------------------------------------
 
-def save_debug(name: str, img: np.ndarray, debug_dir: Path | None) -> None:
+def _save(name: str, img: np.ndarray, debug_dir: Path | None) -> None:
     if debug_dir is None:
         return
     debug_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(debug_dir / name), img)
 
 
-def save_debug_pil(name: str, img: Image.Image, debug_dir: Path | None) -> None:
+def _save_pil(name: str, img: Image.Image, debug_dir: Path | None) -> None:
     if debug_dir is None:
         return
     debug_dir.mkdir(parents=True, exist_ok=True)
     img.save(debug_dir / name)
 
 
-def draw_boxes_overlay(img_np: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> np.ndarray:
+def _boxes_overlay(img_np: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> np.ndarray:
     overlay = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2BGR).copy()
     for i, (x, y, w, h) in enumerate(boxes, start=1):
         cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), 3)
         cv2.putText(overlay, str(i), (x + 4, y + 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     return overlay
-
-
-def labeled_panel(img_gray: np.ndarray, label: str, font_scale: float = 1.2) -> np.ndarray:
-    """Convert a grayscale image to BGR and stamp a label at the top."""
-    panel = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-    cv2.putText(panel, label, (10, 36), cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale, (0, 200, 255), 2, cv2.LINE_AA)
-    return panel
-
-
-def side_by_side(images: list[np.ndarray], gap: int = 8) -> np.ndarray:
-    """Stack BGR images horizontally with a thin black gap."""
-    h = max(im.shape[0] for im in images)
-    padded = []
-    for im in images:
-        if im.shape[0] < h:
-            pad = np.zeros((h - im.shape[0], im.shape[1], 3), dtype=np.uint8)
-            im = np.vstack([im, pad])
-        padded.append(im)
-        padded.append(np.zeros((h, gap, 3), dtype=np.uint8))
-    return np.hstack(padded[:-1])
 
 
 # ---------------------------------------------------------------------------
@@ -116,212 +63,177 @@ def load_image(path: str) -> tuple[Image.Image, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — grayscale
+# Grid detection via projection profiles
 # ---------------------------------------------------------------------------
 
-def to_grayscale(img_np: np.ndarray, debug_dir: Path | None) -> np.ndarray:
-    gray = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2GRAY)
-    save_debug("01_grayscale.png", gray, debug_dir)
-    return gray
+def _find_grid_cuts(profile: np.ndarray, n_cuts: int, smooth_window: int = 15) -> list[int]:
+    """Return n_cuts valley positions in a 1-D projection profile.
 
+    Divides the profile into n_cuts+1 equal-width bands and finds the minimum
+    in each inter-band region.  Works reliably for regular grids where each
+    band contains roughly the same amount of content.
+    """
+    n = len(profile)
+    kernel = np.ones(smooth_window) / smooth_window
+    smooth = np.convolve(profile.astype(float), kernel, mode='same')
 
-# ---------------------------------------------------------------------------
-# Step 2a — Canny edge detection
-# ---------------------------------------------------------------------------
-
-def detect_edges_canny(
-    gray: np.ndarray,
-    blur_ksize: int,
-    canny_low: int,
-    canny_high: int,
-    debug_dir: Path | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
-    save_debug("02_canny_blurred.png", blurred, debug_dir)
-
-    edges = cv2.Canny(blurred, canny_low, canny_high)
-    save_debug("03a_canny_edges_raw.png", edges, debug_dir)
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
-    save_debug("04a_canny_edges_closed.png", edges_closed, debug_dir)
-
-    return edges, edges_closed
+    section = n // (n_cuts + 1)
+    cuts: list[int] = []
+    for i in range(1, n_cuts + 1):
+        lo = max(0, i * section - section // 2)
+        hi = min(n, i * section + section // 2)
+        local_min = lo + int(np.argmin(smooth[lo:hi]))
+        cuts.append(local_min)
+    return cuts
 
 
 # ---------------------------------------------------------------------------
-# Step 2b — HED edge detection
+# Core segmentation
 # ---------------------------------------------------------------------------
 
-def detect_edges_hed(
+def segment_stickers(
     img_np: np.ndarray,
-    net: cv2.dnn.Net,
-    debug_dir: Path | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    h, w = img_np.shape[:2]
-    img_bgr = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2BGR)
-
-    # ImageNet mean subtraction, no scaling — matches HED training
-    blob = cv2.dnn.blobFromImage(
-        img_bgr, scalefactor=1.0, size=(w, h),
-        mean=(104.00698793, 116.66876762, 122.67891434),
-        swapRB=False, crop=False,
-    )
-    net.setInput(blob)
-    raw = net.forward("sigmoid-fuse")          # shape: (1, 1, H, W)
-    edges_f = raw[0, 0]                        # float32 in [0, 1]
-    edges = (edges_f * 255).clip(0, 255).astype(np.uint8)
-    save_debug("03b_hed_edges_raw.png", edges, debug_dir)
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
-    save_debug("04b_hed_edges_closed.png", edges_closed, debug_dir)
-
-    return edges, edges_closed
-
-
-# ---------------------------------------------------------------------------
-# Step 2c — TEED edge detection
-# ---------------------------------------------------------------------------
-
-def detect_edges_teed(
-    img_np: np.ndarray,
-    model: TED,
-    debug_dir: Path | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    edges = run_teed(model, img_np)
-    save_debug("03c_teed_edges_raw.png", edges, debug_dir)
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
-    save_debug("04c_teed_edges_closed.png", edges_closed, debug_dir)
-
-    return edges, edges_closed
-
-
-# ---------------------------------------------------------------------------
-# Step 2d — side-by-side comparison debug image
-# ---------------------------------------------------------------------------
-
-def save_edge_comparison(
-    canny_raw: np.ndarray,
-    canny_closed: np.ndarray,
-    hed_raw: np.ndarray | None,
-    hed_closed: np.ndarray | None,
-    teed_raw: np.ndarray | None,
-    teed_closed: np.ndarray | None,
-    debug_dir: Path | None,
-) -> None:
-    if debug_dir is None:
-        return
-    panels = [
-        labeled_panel(canny_raw,    "Canny — raw"),
-        labeled_panel(canny_closed, "Canny — closed"),
-    ]
-    if hed_raw is not None and hed_closed is not None:
-        panels += [
-            labeled_panel(hed_raw,      "HED   — raw"),
-            labeled_panel(hed_closed,   "HED   — closed"),
-        ]
-    if teed_raw is not None and teed_closed is not None:
-        panels += [
-            labeled_panel(teed_raw,    "TEED  — raw"),
-            labeled_panel(teed_closed, "TEED  — closed"),
-        ]
-    save_debug("05_edge_comparison.png", side_by_side(panels), debug_dir)
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — fill bubble contours → sticker bounding boxes + per-sticker masks
-# ---------------------------------------------------------------------------
-
-def find_bubble_contours(
-    edges_closed: np.ndarray,
-    img_np: np.ndarray,
+    bg_threshold: int,
+    close_size: int,
+    n_rows: int,
+    n_cols: int,
     min_area: int,
-    step_prefix: str,
+    cell_overlap: int,
     debug_dir: Path | None,
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
-    contours, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+    """Return (boxes, masks) — one per detected sticker, reading order (top→bottom, left→right)."""
 
-    h, w = edges_closed.shape
-    contour_viz = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2BGR).copy()
-    cv2.drawContours(contour_viz, contours, -1, (0, 255, 0), 2)
-    save_debug(f"{step_prefix}_contours.png", contour_viz, debug_dir)
+    h_img, w_img = img_np.shape[:2]
 
-    bubble_fill = np.zeros((h, w), dtype=np.uint8)
+    # Step 1 — grayscale + threshold
+    gray = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2GRAY)
+    _save("01_grayscale.png", gray, debug_dir)
+
+    _, thresh = cv2.threshold(gray, bg_threshold, 255, cv2.THRESH_BINARY_INV)
+    _save("02_threshold.png", thresh, debug_dir)
+
+    # Step 2 — find grid cut positions from projection profiles
+    h_proj = thresh.sum(axis=1)   # sum per row
+    v_proj = thresh.sum(axis=0)   # sum per column
+
+    row_cuts = [0] + _find_grid_cuts(h_proj, n_rows - 1) + [h_img]
+    col_cuts = [0] + _find_grid_cuts(v_proj, n_cols - 1) + [w_img]
+
+    if debug_dir is not None:
+        grid_viz = cv2.cvtColor(img_np[:, :, :3], cv2.COLOR_RGB2BGR).copy()
+        for y in row_cuts[1:-1]:
+            cv2.line(grid_viz, (0, y), (w_img, y), (0, 0, 255), 3)
+        for x in col_cuts[1:-1]:
+            cv2.line(grid_viz, (x, 0), (x, h_img), (255, 0, 0), 3)
+        _save("03_grid.png", grid_viz, debug_dir)
+
+    # Step 3 — per-cell: flood-fill the sheet background from the cell perimeter.
+    # The shadow ring blocks the flood fill; anything it can't reach is sticker content.
+    # A small close on the dark-pixel mask seals hairline gaps in the shadow ring first.
+    gap_seal_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+
     boxes: list[tuple[int, int, int, int]] = []
     masks: list[np.ndarray] = []
 
-    for c in contours:
-        m = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(m, [c], -1, 255, cv2.FILLED)
-        masks.append(m)
-        x, y, bw, bh = cv2.boundingRect(c)
-        boxes.append((x, y, bw, bh))
-        cv2.drawContours(bubble_fill, [c], -1, 255, cv2.FILLED)
+    for row in range(n_rows):
+        cy0, cy1 = row_cuts[row], row_cuts[row + 1]
+        for col in range(n_cols):
+            cx0, cx1 = col_cuts[col], col_cuts[col + 1]
 
-    paired = sorted(zip(boxes, masks), key=lambda p: (p[0][1], p[0][0]))
-    boxes = [p[0] for p in paired]
-    masks = [p[1] for p in paired]
+            # No cell_overlap needed — grid cells already perfectly bound each sticker.
+            cell_gray = gray[cy0:cy1, cx0:cx1]
 
-    save_debug(f"{step_prefix}_fills.png", bubble_fill, debug_dir)
+            # Dark pixels (shadow + content). Small close seals shadow-ring gaps.
+            cell_dark = (cell_gray < bg_threshold).astype(np.uint8) * 255
+            cell_dark_sealed = cv2.morphologyEx(cell_dark, cv2.MORPH_CLOSE, gap_seal_k)
 
-    box_overlay = draw_boxes_overlay(img_np, boxes)
-    save_debug(f"{step_prefix}_boxes.png", box_overlay, debug_dir)
+            # near-white mask: pixels the flood fill is allowed to travel through
+            near_white = cv2.bitwise_not(cell_dark_sealed)
+
+            # Pad with 1-px white border so the seed (0,0) is always exterior background.
+            padded = cv2.copyMakeBorder(near_white, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=255)
+            flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), dtype=np.uint8)
+            cv2.floodFill(padded, flood_mask, (0, 0), 128)   # exterior background → 128
+            flooded = padded[1:-1, 1:-1]
+
+            # Background = near-white pixels reached by flood fill (marked 128).
+            # Sticker   = everything else (dark pixels + enclosed near-white interior).
+            bg_reached = (flooded == 128).astype(np.uint8) * 255
+            cell_filled = cv2.bitwise_not(bg_reached)
+
+            # Bounding box of the sticker content in this cell
+            ys, xs = np.where(cell_filled > 0)
+            if len(xs) == 0 or (cell_filled > 0).sum() < min_area:
+                continue
+            lx_cell, ly_cell = int(xs.min()), int(ys.min())
+            lw = int(xs.max()) - lx_cell + 1
+            lh = int(ys.max()) - ly_cell + 1
+
+            # Place cell mask into full-image coordinates
+            full_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            full_mask[cy0:cy1, cx0:cx1] = cell_filled
+
+            lx = lx_cell + cx0
+            ly = ly_cell + cy0
+
+            boxes.append((lx, ly, lw, lh))
+            masks.append(full_mask)
+
+    if debug_dir is not None:
+        combined = np.zeros((h_img, w_img), dtype=np.uint8)
+        for m in masks:
+            combined = cv2.bitwise_or(combined, m)
+        _save("04_filled.png", combined, debug_dir)
+
+        rng = np.random.default_rng(42)
+        label_viz = np.zeros((h_img, w_img, 3), dtype=np.uint8)
+        for m in masks:
+            color = rng.integers(80, 255, size=3).tolist()
+            label_viz[m > 0] = color
+        _save("05_labels.png", label_viz, debug_dir)
+
+        _save("06_boxes.png", _boxes_overlay(img_np, boxes), debug_dir)
 
     return boxes, masks
 
 
-def save_fill_comparison(
-    canny_fill: np.ndarray,
-    hed_fill: np.ndarray | None,
-    teed_fill: np.ndarray | None,
-    debug_dir: Path | None,
-) -> None:
-    if debug_dir is None:
-        return
-    panels = [labeled_panel(canny_fill, "Canny fills")]
-    if hed_fill is not None:
-        panels.append(labeled_panel(hed_fill, "HED fills"))
-    if teed_fill is not None:
-        panels.append(labeled_panel(teed_fill, "TEED fills"))
-    save_debug("08_fill_comparison.png", side_by_side(panels), debug_dir)
-
-
 # ---------------------------------------------------------------------------
-# Step 4 — extract each sticker using its bubble mask
+# Sticker extraction
 # ---------------------------------------------------------------------------
 
 def extract_stickers(
     img_pil: Image.Image,
     img_np: np.ndarray,
     boxes: list[tuple[int, int, int, int]],
-    bubble_masks: list[np.ndarray],
+    masks: list[np.ndarray],
     padding: int,
+    shadow_blur: int,
     out_dir: Path,
     prefix: str,
     debug_dir: Path | None,
 ) -> list[Path]:
     h_img, w_img = img_np.shape[:2]
+    # blur_k=1 is a no-op (1×1 kernel); 0 is treated as "no blur"
+    blur_k = max(1, shadow_blur if shadow_blur % 2 == 1 else shadow_blur + 1)
     saved: list[Path] = []
 
-    for i, ((x, y, w, h), full_mask) in enumerate(zip(boxes, bubble_masks), start=1):
+    for i, ((x, y, bw, bh), full_mask) in enumerate(zip(boxes, masks), start=1):
         x0 = max(0, x - padding)
         y0 = max(0, y - padding)
-        x1 = min(w_img, x + w + padding)
-        y1 = min(h_img, y + h + padding)
+        x1 = min(w_img, x + bw + padding)
+        y1 = min(h_img, y + bh + padding)
 
         crop_rgba = img_pil.crop((x0, y0, x1, y1)).convert("RGBA")
-        alpha = full_mask[y0:y1, x0:x1]
-        alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+
+        alpha = full_mask[y0:y1, x0:x1].copy()
+        if blur_k > 1:
+            alpha = cv2.GaussianBlur(alpha, (blur_k, blur_k), 0)
 
         if debug_dir is not None:
             tag = f"sticker_{i:02d}"
             crop_bgr = cv2.cvtColor(np.array(crop_rgba)[:, :, :3], cv2.COLOR_RGB2BGR)
-            save_debug(f"{tag}_a_crop.png", crop_bgr, debug_dir)
-            save_debug(f"{tag}_b_mask.png", alpha, debug_dir)
+            _save(f"{tag}_a_crop.png", crop_bgr, debug_dir)
+            _save(f"{tag}_b_mask.png", alpha, debug_dir)
 
         r, g, b, _ = crop_rgba.split()
         result = Image.merge("RGBA", (r, g, b, Image.fromarray(alpha)))
@@ -331,7 +243,7 @@ def extract_stickers(
         saved.append(out_path)
 
         if debug_dir is not None:
-            save_debug_pil(f"sticker_{i:02d}_c_result.png", result, debug_dir)
+            _save_pil(f"sticker_{i:02d}_c_result.png", result, debug_dir)
 
         print(f"  [{i:02d}/{len(boxes)}] {out_path.name}  ({x1-x0}×{y1-y0}px)")
 
@@ -344,20 +256,33 @@ def extract_stickers(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Split a sticker sheet into individual transparent PNGs using bubble-edge segmentation."
+        description="Split a sticker sheet into individual transparent PNGs."
     )
     parser.add_argument("sheet", help="Path to input sticker sheet image")
     parser.add_argument("--out-dir", default="stickers_out")
-    parser.add_argument("--debug", action="store_true", help="Save pipeline debug images to --debug-dir")
+    parser.add_argument("--debug", action="store_true", help="Save pipeline debug images")
     parser.add_argument("--debug-dir", default="debug")
-    parser.add_argument("--compare", action="store_true",
-                        help="Run HED and TEED alongside Canny and save side-by-side comparisons (requires --debug; downloads models on first run)")
-    parser.add_argument("--models-dir", default="models", help="Directory to cache HED model files")
-    parser.add_argument("--padding", type=int, default=20)
-    parser.add_argument("--min-area", type=int, default=5000)
-    parser.add_argument("--blur", type=int, default=5, help="Gaussian blur kernel for Canny (must be odd)")
-    parser.add_argument("--canny-low", type=int, default=30)
-    parser.add_argument("--canny-high", type=int, default=80)
+    parser.add_argument("--n-rows", type=int, default=5,
+                        help="Number of sticker rows in the sheet (default 5)")
+    parser.add_argument("--n-cols", type=int, default=3,
+                        help="Number of sticker columns in the sheet (default 3)")
+    parser.add_argument("--bg-threshold", type=int, default=250,
+                        help="Grayscale value above which a pixel is background white (default 250). "
+                             "Lower to capture more shadow; raise if content is clipped.")
+    parser.add_argument("--close-size", type=int, default=80,
+                        help="Morphological close kernel diameter in pixels (default 30). "
+                             "Raise to bridge larger intra-sticker gaps; lower if mask bleeds outside sticker.")
+    parser.add_argument("--shadow-blur", type=int, default=0,
+                        help="Gaussian blur kernel for alpha edge softening (default 0 = hard edge). "
+                             "Only set >0 if you want a feathered edge and content never touches the mask boundary.")
+    parser.add_argument("--padding", type=int, default=25,
+                        help="Extra pixels around each sticker in output (default 25).")
+    parser.add_argument("--min-area", type=int, default=5000,
+                        help="Minimum sticker blob area in pixels (default 5000).")
+    parser.add_argument("--cell-overlap", type=int, default=50,
+                        help="Pixels to expand each grid cell beyond its boundary when extracting "
+                             "content (default 50). Captures floating elements like decorative marks "
+                             "that sit just outside the nominal cell edge.")
     parser.add_argument("--prefix", default="sticker")
     args = parser.parse_args()
 
@@ -366,7 +291,6 @@ def main() -> None:
         print(f"Error: file not found: {sheet_path}", file=sys.stderr)
         sys.exit(1)
 
-    blur_ksize = args.blur if args.blur % 2 == 1 else args.blur + 1
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = Path(args.debug_dir) if args.debug else None
@@ -375,78 +299,29 @@ def main() -> None:
     img_pil, img_np = load_image(str(sheet_path))
     print(f"Image size: {img_pil.width}×{img_pil.height}px")
 
-    print("Step 1 — grayscale...")
-    gray = to_grayscale(img_np, debug_dir)
-
-    print(f"Step 2a — Canny edges (blur={blur_ksize}, thresholds={args.canny_low}/{args.canny_high})...")
-    canny_raw, canny_closed = detect_edges_canny(gray, blur_ksize, args.canny_low, args.canny_high, debug_dir)
-
-    hed_raw = hed_closed = None
-    teed_raw = teed_closed = None
-    if args.compare:
-        if not args.debug:
-            print("Warning: --compare has no effect without --debug. Add --debug to save comparison images.")
-        else:
-            print("Step 2b — HED edges (loading model)...")
-            net = load_hed_net(Path(args.models_dir))
-            hed_raw, hed_closed = detect_edges_hed(img_np, net, debug_dir)
-
-            print("Step 2c — TEED edges (loading model)...")
-            teed_model = load_teed_net(Path(args.models_dir))
-            teed_raw, teed_closed = detect_edges_teed(img_np, teed_model, debug_dir)
-
-            save_edge_comparison(canny_raw, canny_closed, hed_raw, hed_closed, teed_raw, teed_closed, debug_dir)
-
-    # Use HED for segmentation when available, otherwise TEED, otherwise Canny
-    if hed_closed is not None:
-        active_edges, active_label = hed_closed, "HED"
-    elif teed_closed is not None:
-        active_edges, active_label = teed_closed, "TEED"
-    else:
-        active_edges, active_label = canny_closed, "Canny"
-
-    print(f"Step 3 — bubble contours via {active_label} (min-area={args.min_area})...")
-    boxes, masks = find_bubble_contours(active_edges, img_np, args.min_area, "06_active", debug_dir)
+    print(f"Segmenting ({args.n_rows}×{args.n_cols} grid, "
+          f"bg-threshold={args.bg_threshold}, close-size={args.close_size})...")
+    boxes, masks = segment_stickers(
+        img_np,
+        bg_threshold=args.bg_threshold,
+        close_size=args.close_size,
+        n_rows=args.n_rows,
+        n_cols=args.n_cols,
+        min_area=args.min_area,
+        cell_overlap=args.cell_overlap,
+        debug_dir=debug_dir,
+    )
     print(f"Found {len(boxes)} sticker(s)")
 
-    if args.compare and debug_dir is not None and (hed_closed is not None or teed_closed is not None):
-        print("  (also segmenting with remaining detectors for fill comparison...)")
-        h_img, w_img = img_np.shape[:2]
-
-        # active fill (HED or TEED, whichever drove segmentation)
-        active_fill = np.zeros((h_img, w_img), dtype=np.uint8)
-        for m in masks:
-            active_fill = cv2.bitwise_or(active_fill, m)
-
-        _, canny_masks = find_bubble_contours(canny_closed, img_np, args.min_area, "07_canny", debug_dir)
-        canny_fill = np.zeros((h_img, w_img), dtype=np.uint8)
-        for m in canny_masks:
-            canny_fill = cv2.bitwise_or(canny_fill, m)
-
-        hed_fill: np.ndarray | None = None
-        teed_fill: np.ndarray | None = None
-        if hed_closed is not None and teed_closed is not None:
-            # active was HED; also compute TEED fill
-            hed_fill = active_fill
-            _, teed_masks = find_bubble_contours(teed_closed, img_np, args.min_area, "07_teed", debug_dir)
-            teed_fill = np.zeros((h_img, w_img), dtype=np.uint8)
-            for m in teed_masks:
-                teed_fill = cv2.bitwise_or(teed_fill, m)
-        elif hed_closed is not None:
-            hed_fill = active_fill
-        else:
-            teed_fill = active_fill
-
-        save_fill_comparison(canny_fill, hed_fill, teed_fill, debug_dir)
-
     if not boxes:
-        print("No bubbles detected. Try lowering --min-area or adjusting edge detection parameters.")
+        print("No stickers detected. Try lowering --bg-threshold or --min-area.")
         sys.exit(1)
 
-    print(f"Step 4 — extracting to: {out_dir}/")
+    print(f"Extracting to: {out_dir}/")
     saved = extract_stickers(
         img_pil, img_np, boxes, masks,
         padding=args.padding,
+        shadow_blur=args.shadow_blur,
         out_dir=out_dir,
         prefix=args.prefix,
         debug_dir=debug_dir,
